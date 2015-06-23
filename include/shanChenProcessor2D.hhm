@@ -1,0 +1,231 @@
+/* This file is part of the Palabos library.
+ *
+ * Copyright (C) 2011-2013 FlowKit Sarl
+ * Route d'Oron 2
+ * 1010 Lausanne, Switzerland
+ * E-mail contact: contact@flowkit.com
+ *
+ * The most recent release of Palabos can be downloaded at 
+ * <http://www.palabos.org/>
+ *
+ * The library Palabos is free software: you can redistribute it and/or
+ * modify it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * The library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+/* The original version of this file was written by Orestis Malaspinas
+ * and Andrea Parmigiani.
+ */
+
+#ifndef SHAN_CHEN_PROCESSOR_2D_HHM
+#define SHAN_CHEN_PROCESSOR_2D_HHM
+
+#include "multiPhysics/shanChenProcessor2D.h"
+#include "core/util.h"
+#include "finiteDifference/finiteDifference2D.h"
+#include "latticeBoltzmann/momentTemplates.h"
+#include "latticeBoltzmann/externalFieldAccess.h"
+#include "multiPhysics/multiPhaseTemplates2D.h"
+
+#include "shanChenProcessor2D.hm"
+
+namespace plb {
+
+template<typename T, template<typename U> class Descriptor>
+ShanChenSingleComponentProcessor2D_mod<T,Descriptor>::ShanChenSingleComponentProcessor2D_mod (
+        T G_, interparticlePotential::PsiFunction<T>* Psi_, Array<T,2> accel_, T rho_avg_, T kappa_ )
+    : G(G_),
+      Psi(Psi_),
+      accel(accel_),
+      rho_avg(rho_avg_),
+      kappa(kappa_)
+{ }
+
+template<typename T, template<typename U> class Descriptor>
+ShanChenSingleComponentProcessor2D_mod<T,Descriptor>::~ShanChenSingleComponentProcessor2D_mod() {
+    // Pointer to Psi function is owned; delete it in the destructor.
+    delete Psi;
+}
+
+template<typename T, template<typename U> class Descriptor>
+ShanChenSingleComponentProcessor2D_mod<T,Descriptor>::ShanChenSingleComponentProcessor2D_mod (
+        ShanChenSingleComponentProcessor2D_mod<T,Descriptor> const& rhs )
+    : G(rhs.G),
+      Psi(rhs.Psi->clone()),
+      accel(rhs.accel),
+      rho_avg(rhs.rho_avg),
+      kappa(rhs.kappa)
+{ }
+
+template<typename T, template<typename U> class Descriptor>
+ShanChenSingleComponentProcessor2D_mod<T,Descriptor>&
+    ShanChenSingleComponentProcessor2D_mod<T,Descriptor>::operator= (
+        ShanChenSingleComponentProcessor2D_mod<T,Descriptor> const& rhs )
+{
+    G = rhs.G;
+    accel = rhs.accel;
+    rho_avg = rhs.rho_avg;
+    kappa = rhs.kappa;
+    delete Psi; Psi = rhs.Psi->clone();
+    return *this;
+}
+
+template<typename T, template<typename U> class Descriptor>
+ShanChenSingleComponentProcessor2D_mod<T,Descriptor>*
+    ShanChenSingleComponentProcessor2D_mod<T,Descriptor>::clone() const
+{
+    return new ShanChenSingleComponentProcessor2D_mod<T,Descriptor>(*this);
+}
+
+template<typename T, template<typename U> class Descriptor>
+void ShanChenSingleComponentProcessor2D_mod<T,Descriptor>::getTypeOfModification(std::vector<modif::ModifT>& modified) const
+{
+    modified[0] = modif::staticVariables;
+}
+
+template<typename T, template<typename U> class Descriptor>
+void ShanChenSingleComponentProcessor2D_mod<T,Descriptor>::process (
+        Box2D domain, BlockLattice2D<T,Descriptor>& lattice )
+{
+    // Short-hand notation for the lattice descriptor
+    typedef Descriptor<T> D;
+    // Handle to external scalars
+    enum {
+        densityOffset  = D::ExternalField::densityBeginsAt,
+        momentumOffset = D::ExternalField::momentumBeginsAt,
+        forceOffset = D::ExternalField::forceBeginsAt,
+        gammaOffset = D::ExternalField::gammaBeginsAt,
+        thetaxOffset = D::ExternalField::thetaxBeginsAt,
+        thetayOffset = D::ExternalField::thetayBeginsAt
+    };
+
+    plint nx = domain.getNx() + 2;  // Include a one-cell boundary
+    plint ny = domain.getNy() + 2;  // Include a one-cell boundary
+    plint offsetX = domain.x0-1;
+    plint offsetY = domain.y0-1;
+    ScalarField2D<T> psiField(nx,ny);
+    
+    // Compute density and momentum on every site and store result in external scalars;
+    //   furthermore, evaluate the interaction potential Psi and store it into a ScalarField.
+    //   Envelope cells are included, because they are needed to compute the interaction potential
+    //   in the following. Note that the value of the momentum is stored temporarily only, as
+    //   it is corrected later on to include corrections due to the interaction potential.
+    for (plint iX=domain.x0-1; iX<=domain.x1+1; ++iX) {
+        for (plint iY=domain.y0-1; iY<=domain.y1+1; ++iY) {
+            // Get "intelligent" value of density through cell object, to account
+            //   for the fact that the density value can be user-defined, for example
+            //   on boundaries.
+            Cell<T,Descriptor>& cell = lattice.get(iX,iY);
+            T rho = cell.computeDensity();
+            // Evaluate potential function psi.
+            psiField.get(iX-offsetX, iY-offsetY) = Psi->compute(rho);
+            // Store density into the corresponding external scalar.
+            *cell.getExternal(densityOffset) = rho;
+            // Compute momentum through direct access to particle populations, and store
+            //   result in corresponding external scalars. Note that Cell::computeVelocity
+            //   cannot be used, because it returns the velocity of the external scalars,
+            //   not the velocity computed from the particle populations.
+            Array<T,Descriptor<T>::d> j;
+            momentTemplates<T,Descriptor>::get_j(cell,j);
+            for (int iD=0; iD<Descriptor<T>::d; ++iD) {
+                *(cell.getExternal(momentumOffset)+iD) = j[iD];
+            }
+        }
+    }
+
+    // Compute the interparticle forces, and store in the external force field.
+    for (plint iX=domain.x0; iX<=domain.x1; ++iX) {
+        for (plint iY=domain.y0; iY<=domain.y1; ++iY) {
+            Array<T,D::d> psiContribution;
+            psiContribution.resetToZero();
+            // Compute the term \sum_i ( t_i psi(x+c_i,t) c_i )
+            for (plint iPop = 0; iPop < D::q; ++iPop) {
+                plint nextX = iX + D::c[iPop][0];
+                plint nextY = iY + D::c[iPop][1];
+                T psi = psiField.get(nextX-offsetX, nextY-offsetY);
+                for (int iD = 0; iD < D::d; ++iD) {
+                    psiContribution[iD] += D::t[iPop] * psi * D::c[iPop][iD];
+                }
+            }
+            
+            // Computation and storage of the final momentum, including the momentum
+            //   difference due to interaction potential and the external force.
+            Cell<T,Descriptor>& cell = lattice.get(iX,iY);
+            T rho = *cell.getExternal(densityOffset);
+            T *force = cell.getExternal(forceOffset);
+            T psi = psiField.get(iX-offsetX, iY-offsetY);
+            for (int iD = 0; iD < D::d; ++iD) {
+                // Initialize force contribution with force from external fields
+                T forceContribution = (rho-rho_avg)*accel[iD];
+                // Add interaction term.
+                forceContribution -= G * psi * psiContribution[iD];
+                // Include into force and total momentum.
+                force[iD] = forceContribution;
+            }
+
+            // Computation of gamma
+            T eps0 = 2;
+            T cssq = (T)1/(T)3;
+            T omega = cell.getDynamics().getOmega();
+            T gamma = *cell.getExternal(gammaOffset);
+            gamma = rho * eps0 * omega;
+            gamma /= G * cssq * psi*psi;
+            // gamma *= -(T)1/(T)8;
+            gamma *= -((T)5-kappa)/(T)36;
+            gamma += (T)1 - omega/(T)4;
+
+            // Contributions to surface tension source term
+            Array<T,D::d> psiContribution1x, psiContribution1y;
+            Array<T,D::d> psiContribution2x, psiContribution2y;
+            psiContribution1x.resetToZero();
+            psiContribution1y.resetToZero();
+            psiContribution2x.resetToZero();
+            psiContribution2y.resetToZero();
+            // Compute the term \sum_i ( t_i psi(x+c_i,t) c_i )
+            for (plint iPop = 0; iPop < D::q; ++iPop) {
+                plint nextX = iX + D::c[iPop][0];
+                plint nextY = iY + D::c[iPop][1];
+                plint prevX = iX - D::c[iPop][0];
+                plint prevY = iY - D::c[iPop][1];
+                T psi_next = psiField.get(nextX-offsetX, nextY-offsetY);
+                T psi_prev = psiField.get(prevX-offsetX, prevY-offsetY);
+                for (int iD = 0; iD < D::d; ++iD) {
+                    psiContribution1x[iD] += D::t[iPop] * (psi_next - psi) * D::c[iPop][0] * D::c[iPop][iD];
+                    psiContribution1y[iD] += D::t[iPop] * (psi_next - psi) * D::c[iPop][1] * D::c[iPop][iD];
+                }
+                psiContribution2x[0] += D::t[iPop] * (psi_next - (T)2*psi + psi_prev);
+                psiContribution2y[1] += D::t[iPop] * (psi_next - (T)2*psi + psi_prev);
+            }
+            
+            // Computation and storage of the surface tension term
+            // Note1: Its probably nicer to rewrite this as a tensor if possible
+            // Note2: could be made more efficient since thetax_y = thetay_x
+            T *thetax = cell.getExternal(thetaxOffset);
+            T *thetay = cell.getExternal(thetayOffset);
+            for (int iD = 0; iD < D::d; ++iD) {
+                // xx & xy component of theta
+                thetax[iD] = -(T)0.5*kappa*psiContribution1x[iD];
+                thetax[iD] += (kappa+(T)1)/(T)12*psiContribution2x[iD];
+                thetax[iD] *= G * cssq * psi;
+                // yx & yy component of theta
+                thetay[iD] = -(T)0.5*kappa*psiContribution1y[iD];
+                thetay[iD] += (kappa+(T)1)/(T)12*psiContribution2y[iD];
+                thetay[iD] *= G * cssq * psi;
+            }
+        }
+    }
+}
+
+}  // namespace plb
+
+#endif  // SHAN_CHEN_PROCESSOR_2D_HHM
+    

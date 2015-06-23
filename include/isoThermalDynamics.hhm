@@ -1,0 +1,295 @@
+/* This file is part of the Palabos library.
+ *
+ * Copyright (C) 2011-2013 FlowKit Sarl
+ * Route d'Oron 2
+ * 1010 Lausanne, Switzerland
+ * E-mail contact: contact@flowkit.com
+ *
+ * The most recent release of Palabos can be downloaded at 
+ * <http://www.palabos.org/>
+ *
+ * The library Palabos is free software: you can redistribute it and/or
+ * modify it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * The library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+/** \file
+ * A collection of dynamics classes (e.g. BGK) with which a Cell object
+ * can be instantiated -- generic implementation.
+ */
+#ifndef ISO_THERMAL_DYNAMICS_HHM
+#define ISO_THERMAL_DYNAMICS_HHM
+
+#include "basicDynamics/isoThermalDynamics.h"
+#include "core/cell.h"
+#include "core/dynamicsIdentifiers.h"
+#include "latticeBoltzmann/dynamicsTemplates.h"
+#include "latticeBoltzmann/momentTemplates.h"
+#include "latticeBoltzmann/externalForceTemplates.h"
+#include "latticeBoltzmann/offEquilibriumTemplates.h"
+#include "latticeBoltzmann/d3q13Templates.h"
+#include "latticeBoltzmann/geometricOperationTemplates.h"
+#include "core/latticeStatistics.h"
+#include <algorithm>
+#include <limits>
+
+#include "isoThermalDynamics.hm"
+
+namespace plb {
+
+/* *************** Class GuoExternalMomentBGKdynamics ********************************** */
+
+template<typename T, template<typename U> class Descriptor>
+int GuoExternalMomentBGKdynamics<T,Descriptor>::id =
+    meta::registerOneParamDynamics<T,Descriptor,GuoExternalMomentBGKdynamics<T,Descriptor> >("BGK_GuoExternalMoment");
+
+/** \param omega_ relaxation parameter, related to the dynamic viscosity
+ */
+template<typename T, template<typename U> class Descriptor>
+GuoExternalMomentBGKdynamics<T,Descriptor>::GuoExternalMomentBGKdynamics(T omega_ )
+    : IsoThermalBulkDynamics<T,Descriptor>(omega_)
+{ }
+
+template<typename T, template<typename U> class Descriptor>
+GuoExternalMomentBGKdynamics<T,Descriptor>* GuoExternalMomentBGKdynamics<T,Descriptor>::clone() const {
+    return new GuoExternalMomentBGKdynamics<T,Descriptor>(*this);
+}
+
+template<typename T, template<typename U> class Descriptor>
+int GuoExternalMomentBGKdynamics<T,Descriptor>::getId() const {
+    return id;
+}
+
+template<typename T, template<typename U> class Descriptor>
+void GuoExternalMomentBGKdynamics<T,Descriptor>::collide (
+        Cell<T,Descriptor>& cell,
+        BlockStatistics& statistics )
+{
+    T& rho = *cell.getExternal(Descriptor<T>::ExternalField::densityBeginsAt);
+    T rhoBar = Descriptor<T>::rhoBar(rho);
+    Array<T,Descriptor<T>::d> j;
+    j.from_cArray( cell.getExternal(Descriptor<T>::ExternalField::momentumBeginsAt) );
+    T uSqr = dynamicsTemplates<T,Descriptor>::bgk_ma2_collision(cell, rhoBar, j, this->getOmega());
+
+    // add guo forcing
+    Array<T,Descriptor<T>::d> u;
+    T invRho = Descriptor<T>::invRho(rho);
+    for (plint iD = 0; iD < Descriptor<T>::d; ++iD)
+    {
+        u[iD] = invRho * j[iD];
+    }
+    
+    Array<T,Descriptor<T>::q>& f = cell.getRawPopulations();
+    
+    Array<T,Descriptor<T>::d> force;
+    force.from_cArray( cell.getExternal(Descriptor<T>::ExternalField::forceBeginsAt) );
+    for (plint iPop=0; iPop < Descriptor<T>::q; ++iPop) 
+    {
+        T c_u = T();
+        for (int iD=0; iD<Descriptor<T>::d; ++iD) {
+            c_u += Descriptor<T>::c[iPop][iD]*u[iD];
+        }
+        c_u *= Descriptor<T>::invCs2 * Descriptor<T>::invCs2;
+        T forceTerm = T();
+        for (int iD=0; iD < Descriptor<T>::d; ++iD) {
+            forceTerm +=
+                (   ((T)Descriptor<T>::c[iPop][iD]-u[iD]) * Descriptor<T>::invCs2
+                     + c_u * (T)Descriptor<T>::c[iPop][iD]
+                )
+                * force[iD];
+        }
+        forceTerm *= Descriptor<T>::t[iPop];
+        forceTerm *= (T)1-this->getOmega()/(T)2;
+        f[iPop] += forceTerm;
+    }
+
+    if (cell.takesStatistics()) {
+        gatherStatistics(statistics, rhoBar, uSqr);
+    }
+}
+
+template<typename T, template<typename U> class Descriptor>
+void GuoExternalMomentBGKdynamics<T,Descriptor>::collideExternal (
+        Cell<T,Descriptor>& cell, T rhoBar,
+        Array<T,Descriptor<T>::d> const& j, T thetaBar, BlockStatistics& stat )
+{
+    dynamicsTemplates<T,Descriptor>::bgk_ma2_collision(cell, rhoBar, j, this->getOmega());
+}
+
+template<typename T, template<typename U> class Descriptor>
+T GuoExternalMomentBGKdynamics<T,Descriptor>::computeEquilibrium (
+        plint iPop, T rhoBar, Array<T,Descriptor<T>::d> const& j,
+        T jSqr, T thetaBar) const
+{
+    T invRho = Descriptor<T>::invRho(rhoBar);
+    return dynamicsTemplates<T,Descriptor>::bgk_ma2_equilibrium(iPop, rhoBar, invRho, j, jSqr);
+}
+
+template<typename T, template<typename U> class Descriptor>
+void GuoExternalMomentBGKdynamics<T,Descriptor>::computeVelocity (
+             Cell<T,Descriptor> const& cell,
+             Array<T,Descriptor<T>::d>& u ) const
+{
+    T const& rho = *cell.getExternal(Descriptor<T>::ExternalField::densityBeginsAt);
+    u.from_cArray( cell.getExternal(Descriptor<T>::ExternalField::momentumBeginsAt) );
+    u /= rho;
+}
+
+template<typename T, template<typename U> class Descriptor>
+T GuoExternalMomentBGKdynamics<T,Descriptor>::computeRhoBar(Cell<T,Descriptor> const& cell) const
+{
+    return momentTemplates<T,Descriptor>::get_rhoBar(cell);
+}
+
+template<typename T, template<typename U> class Descriptor>
+void GuoExternalMomentBGKdynamics<T,Descriptor>::computeRhoBarJ (
+                                Cell<T,Descriptor> const& cell,
+                                T& rhoBar, Array<T,Descriptor<T>::d>& j ) const
+{
+    momentTemplates<T,Descriptor>::get_rhoBar_j(cell, rhoBar, j);
+}
+
+/* *************** Class GeneralExternalMomentBGKdynamics ********************************** */
+
+template<typename T, template<typename U> class Descriptor>
+int GeneralExternalMomentBGKdynamics<T,Descriptor>::id =
+    meta::registerOneParamDynamics<T,Descriptor,GeneralExternalMomentBGKdynamics<T,Descriptor> >("BGK_GeneralExternalMoment");
+
+/** \param omega_ relaxation parameter, related to the dynamic viscosity
+ */
+template<typename T, template<typename U> class Descriptor>
+GeneralExternalMomentBGKdynamics<T,Descriptor>::GeneralExternalMomentBGKdynamics(T omega_)
+    : IsoThermalBulkDynamics<T,Descriptor>(omega_)
+{ }
+
+template<typename T, template<typename U> class Descriptor>
+GeneralExternalMomentBGKdynamics<T,Descriptor>* GeneralExternalMomentBGKdynamics<T,Descriptor>::clone() const {
+    return new GeneralExternalMomentBGKdynamics<T,Descriptor>(*this);
+}
+
+template<typename T, template<typename U> class Descriptor>
+int GeneralExternalMomentBGKdynamics<T,Descriptor>::getId() const {
+    return id;
+}
+
+template<typename T, template<typename U> class Descriptor>
+void GeneralExternalMomentBGKdynamics<T,Descriptor>::collide (
+        Cell<T,Descriptor>& cell,
+        BlockStatistics& statistics)
+{
+    T& rho = *cell.getExternal(Descriptor<T>::ExternalField::densityBeginsAt);
+    T rhoBar = Descriptor<T>::rhoBar(rho);
+    Array<T,Descriptor<T>::d> j;
+    j.from_cArray( cell.getExternal(Descriptor<T>::ExternalField::momentumBeginsAt) );
+    T uSqr = dynamicsTemplates<T,Descriptor>::bgk_ma2_collision(cell, rhoBar, j, this->getOmega());
+
+    // add general forcing
+    Array<T,Descriptor<T>::d> u;
+    T invRho = Descriptor<T>::invRho(rho);
+    for (plint iD = 0; iD < Descriptor<T>::d; ++iD)
+    {
+        u[iD] = invRho * j[iD];
+    }
+
+    T cssq = (T)1/(T)3;
+    // T gamma = T();
+    // std::string forcing = "guo";
+    // if (forcing == "edm") {
+        // gamma = (T)1; // Exact Difference Method
+    // } else if (forcing == "shan-chen") {
+        // gamma = (T)1/this->getOmega(); // Shan-Chen forcing
+    // } else if (forcing == "guo") {
+        // gamma = (T)1-this->getOmega()/(T)4; // Guo forcing
+    // } else if (forcing == "lycett-brown") {
+        // gamma = (T)12; // Lycett-Brown forcing
+    // }
+
+    Array<T,Descriptor<T>::q>& f = cell.getRawPopulations();
+   
+    Array<T,Descriptor<T>::d> force, thetax, thetay;
+    force.from_cArray( cell.getExternal(Descriptor<T>::ExternalField::forceBeginsAt) );
+    thetax.from_cArray( cell.getExternal(Descriptor<T>::ExternalField::thetaxBeginsAt) );
+    thetay.from_cArray( cell.getExternal(Descriptor<T>::ExternalField::thetayBeginsAt) );
+    T& gamma = *cell.getExternal(Descriptor<T>::ExternalField::gammaBeginsAt);
+    for (plint iPop=0; iPop < Descriptor<T>::q; ++iPop) 
+    {
+        T c_f = T();
+        for (int iD=0; iD<Descriptor<T>::d; ++iD) {
+            c_f += Descriptor<T>::c[iPop][iD]*force[iD];
+        }
+        T forceTerm = ((T)Descriptor<T>::c[iPop][0]*(T)Descriptor<T>::c[iPop][0] - cssq) * (
+            u[0]*force[0] + force[0]*u[0] + gamma*force[0]*force[0]*invRho
+            + this->getOmega() * thetax[0] );
+        forceTerm += (T)Descriptor<T>::c[iPop][0]*(T)Descriptor<T>::c[iPop][1] * (
+            u[0]*force[1] + force[0]*u[1] + gamma*force[0]*force[1]*invRho
+            + this->getOmega() * thetax[1] );
+        forceTerm += (T)Descriptor<T>::c[iPop][1]*(T)Descriptor<T>::c[iPop][0] * (
+            u[1]*force[0] + force[1]*u[0] + gamma*force[1]*force[0]*invRho
+            + this->getOmega() * thetay[0] );
+        forceTerm += ((T)Descriptor<T>::c[iPop][1]*(T)Descriptor<T>::c[iPop][1] - cssq) * (
+            u[1]*force[1] + force[1]*u[1] + gamma*force[1]*force[1]*invRho
+            + this->getOmega() * thetay[1] );          
+        forceTerm *= (T)0.5 * Descriptor<T>::invCs2 * Descriptor<T>::invCs2;
+        forceTerm += c_f * Descriptor<T>::invCs2;
+        forceTerm *= Descriptor<T>::t[iPop];
+        f[iPop] += forceTerm; 
+    }
+    
+    if (cell.takesStatistics()) {
+        gatherStatistics(statistics, rhoBar, uSqr);
+    }
+}
+
+template<typename T, template<typename U> class Descriptor>
+void GeneralExternalMomentBGKdynamics<T,Descriptor>::collideExternal (
+        Cell<T,Descriptor>& cell, T rhoBar,
+        Array<T,Descriptor<T>::d> const& j, T thetaBar, BlockStatistics& stat )
+{
+    dynamicsTemplates<T,Descriptor>::bgk_ma2_collision(cell, rhoBar, j, this->getOmega());
+}
+
+template<typename T, template<typename U> class Descriptor>
+T GeneralExternalMomentBGKdynamics<T,Descriptor>::computeEquilibrium (
+        plint iPop, T rhoBar, Array<T,Descriptor<T>::d> const& j,
+        T jSqr, T thetaBar) const
+{
+    T invRho = Descriptor<T>::invRho(rhoBar);
+    return dynamicsTemplates<T,Descriptor>::bgk_ma2_equilibrium(iPop, rhoBar, invRho, j, jSqr);
+}
+
+template<typename T, template<typename U> class Descriptor>
+void GeneralExternalMomentBGKdynamics<T,Descriptor>::computeVelocity (
+             Cell<T,Descriptor> const& cell,
+             Array<T,Descriptor<T>::d>& u ) const
+{
+    T const& rho = *cell.getExternal(Descriptor<T>::ExternalField::densityBeginsAt);
+    u.from_cArray( cell.getExternal(Descriptor<T>::ExternalField::momentumBeginsAt) );
+    u /= rho;
+}
+
+template<typename T, template<typename U> class Descriptor>
+T GeneralExternalMomentBGKdynamics<T,Descriptor>::computeRhoBar(Cell<T,Descriptor> const& cell) const
+{
+    return momentTemplates<T,Descriptor>::get_rhoBar(cell);
+}
+
+template<typename T, template<typename U> class Descriptor>
+void GeneralExternalMomentBGKdynamics<T,Descriptor>::computeRhoBarJ (
+                                Cell<T,Descriptor> const& cell,
+                                T& rhoBar, Array<T,Descriptor<T>::d>& j ) const
+{
+    momentTemplates<T,Descriptor>::get_rhoBar_j(cell, rhoBar, j);
+}
+
+}  // namespace plb
+
+#endif  // ISO_THERMAL_DYNAMICS_HHM
